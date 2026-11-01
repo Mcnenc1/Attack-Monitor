@@ -1,0 +1,491 @@
+/*
+ * wifi-attack-monitor  —  multi-mode passive wireless-attack monitor
+ *                        for the Heltec WiFi LoRa 32 (V3), ESP32-S3.
+ * ---------------------------------------------------------------------------
+ * DEFENSIVE / LISTEN-ONLY. This firmware never transmits attack frames (no
+ * deauth, no beacons, no probe responses) and never captures credentials. It
+ * only listens to the air and warns you about attacks happening near you.
+ *
+ * Press the PRG / USER button (GPIO 0) to cycle modes. Each mode has its own
+ * screen:
+ *
+ *   1. DEAUTH SNIFFER   - counts deauth/disassoc frames, shows rate + channel,
+ *                         alerts on a flood.
+ *   2. JAM DETECTOR     - watches total frame rate; alerts on an RF flood /
+ *                         interference storm (the detectable form of jamming).
+ *   3. EVIL PORTAL      - flags OPEN access points using bait SSIDs, and APs
+ *                         impersonating your protected SSIDs (evil twin).
+ *   4. BT JAM SNIFFER   - scans BLE and alerts on an advertisement flood
+ *                         (BLE "spam"/jam). Requires ENABLE_BT below.
+ *
+ * Toolchain: Arduino-ESP32 core 2.x/3.x. Needs the "U8g2" library. BT mode also
+ * uses the ESP32 core's built-in BLE library.
+ *
+ * Heltec V3 setup: Tools -> USB CDC On Boot -> Enabled (for Serial), board
+ * "Heltec WiFi LoRa 32(V3)" or "ESP32S3 Dev Module". 2.4 GHz only.
+ */
+
+#define ENABLE_BT 1          // set 0 if the BLE build ever fails; modes 1-3 stay
+
+#include <WiFi.h>
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
+#include <U8g2lib.h>
+#include <Wire.h>
+#if ENABLE_BT
+  #include <BLEDevice.h>
+  #include <BLEScan.h>
+  #include <BLEAdvertisedDevice.h>
+#endif
+
+// ----------------------------------------------------------------------------
+// CONFIG
+// ----------------------------------------------------------------------------
+
+// SSIDs you own; an unknown BSSID broadcasting one of these = suspected evil
+// twin (Evil Portal mode).
+const char* kProtectedSsids[] = { "Guest WiFi", "Acme-Guest" };
+const int kProtectedSsidCount = sizeof(kProtectedSsids) / sizeof(kProtectedSsids[0]);
+
+// Legit BSSIDs allowed to broadcast your protected SSIDs.
+const uint8_t kAllowedBssids[][6] = {
+  { 0xAA, 0xBB, 0xCC, 0x11, 0x22, 0x33 },
+};
+const int kAllowedBssidCount = sizeof(kAllowedBssids) / sizeof(kAllowedBssids[0]);
+
+// OPEN access points using one of these names are flagged as evil portals.
+// ADD YOUR TEST PORTAL'S EXACT SSID HERE. Case-insensitive.
+const char* kBaitSsids[] = {
+  "Free WiFi", "Free Public WiFi", "Public WiFi", "Guest WiFi",
+  "xfinitywifi", "attwifi",
+};
+const int kBaitSsidCount = sizeof(kBaitSsids) / sizeof(kBaitSsids[0]);
+
+// Thresholds (per 1 s rate window unless noted).
+const uint32_t kDeauthRateAlert   = 15;    // deauth frames/s -> flood
+const uint32_t kJamRateAlert      = 1200;  // total frames/s -> RF flood/jam
+const int      kBtAdvRateAlert    = 80;    // BLE advs per 1 s scan -> BT spam
+
+// Channel sweep (WiFi modes).
+const uint32_t kChannelDwellMs = 150;      // >= one beacon interval (~102 ms)
+const int kMaxChannel = 13;
+
+// Hardware pins (Heltec V3).
+const int kButtonPin  = 0;                 // PRG / USER button (active low)
+const int kAlertLedPin = 35;               // onboard LED (-1 to disable)
+const int kOledSda = 17, kOledScl = 18, kOledRst = 21, kVextPin = 36;
+
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, kOledRst, kOledScl, kOledSda);
+
+// ----------------------------------------------------------------------------
+// Modes
+// ----------------------------------------------------------------------------
+
+enum Mode { MODE_DEAUTH = 0, MODE_JAM, MODE_PORTAL, MODE_BT, MODE_COUNT };
+const char* kModeNames[MODE_COUNT] = {
+  "DEAUTH SNIFFER", "JAM DETECTOR", "EVIL PORTAL", "BT JAM SNIFFER"
+};
+static volatile int gMode = MODE_DEAUTH;
+
+// ----------------------------------------------------------------------------
+// Counters (updated by the WiFi promiscuous callback)
+// ----------------------------------------------------------------------------
+
+static volatile uint32_t gAllPkts   = 0;   // every frame (jam)
+static volatile uint32_t gDeauth    = 0;   // deauth/disassoc total
+static volatile int      gLastDeauthCh = 0;
+static volatile uint32_t gBaitHits  = 0;   // open bait APs seen (portal)
+static volatile uint32_t gEvilTwin  = 0;   // evil-twin hits (portal)
+
+// Per-second rates (computed in loop).
+static uint32_t gPktRate = 0, gDeauthRate = 0;
+static uint32_t gRateBasePkts = 0, gRateBaseDeauth = 0, gRateTick = 0;
+
+// Current channel (display).
+static int gCurrentChannel = 1;
+
+// Alert stash — filled anywhere (incl. callback), rendered/announced in loop().
+struct AlertInfo { char kind[40]; char ssid[33]; char bssid[18]; int channel; };
+static volatile bool gAlertPending = false;
+static AlertInfo gLastAlert;
+static uint32_t gAlertScreenUntil = 0;
+static uint32_t gLastPortalAlertMs = 0;
+static const uint32_t kAlertScreenMs = 4000;
+static const uint32_t kPortalCooldownMs = 8000;
+
+#if ENABLE_BT
+static BLEScan* gBleScan = nullptr;
+static bool gBleInited = false;
+static volatile int gBtAdvCount = 0;       // advertisements in the latest scan
+#endif
+static bool gRadioIsBt = false;
+
+// ----------------------------------------------------------------------------
+// Small helpers
+// ----------------------------------------------------------------------------
+
+static void macToStr(const uint8_t* mac, char* out) {
+  sprintf(out, "%02X:%02X:%02X:%02X:%02X:%02X",
+          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+static bool macEquals(const uint8_t* a, const uint8_t* b) {
+  for (int i = 0; i < 6; i++) if (a[i] != b[i]) return false;
+  return true;
+}
+static bool isProtectedSsid(const char* s) {
+  for (int i = 0; i < kProtectedSsidCount; i++)
+    if (strcmp(s, kProtectedSsids[i]) == 0) return true;
+  return false;
+}
+static bool isBaitSsid(const char* s) {
+  for (int i = 0; i < kBaitSsidCount; i++)
+    if (strcasecmp(s, kBaitSsids[i]) == 0) return true;
+  return false;
+}
+static bool isAllowedBssid(const uint8_t* m) {
+  for (int i = 0; i < kAllowedBssidCount; i++)
+    if (macEquals(m, kAllowedBssids[i])) return true;
+  return false;
+}
+
+// Stash an alert. SAFE from the WiFi callback: only writes memory + a flag.
+// All slow work (Serial, LED blink, OLED) happens later in loop().
+static void raiseAlert(const char* kind, const char* ssid,
+                       const uint8_t* bssid, int channel) {
+  char m[18]; macToStr(bssid, m);
+  strncpy(gLastAlert.kind, kind, sizeof(gLastAlert.kind) - 1);
+  gLastAlert.kind[sizeof(gLastAlert.kind) - 1] = '\0';
+  strncpy(gLastAlert.ssid, ssid ? ssid : "", sizeof(gLastAlert.ssid) - 1);
+  gLastAlert.ssid[sizeof(gLastAlert.ssid) - 1] = '\0';
+  strncpy(gLastAlert.bssid, m, sizeof(gLastAlert.bssid) - 1);
+  gLastAlert.bssid[sizeof(gLastAlert.bssid) - 1] = '\0';
+  gLastAlert.channel = channel;
+  gAlertPending = true;
+}
+
+static void flashAlertLed() {
+  if (kAlertLedPin < 0) return;
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(kAlertLedPin, HIGH); delay(50);
+    digitalWrite(kAlertLedPin, LOW);  delay(50);
+  }
+}
+
+static void printAlertSerial(const AlertInfo& a) {
+  Serial.println();
+  Serial.println(F("==============  ALERT  =============="));
+  Serial.printf ("  type : %s\n", a.kind);
+  if (a.ssid[0]) Serial.printf("  ssid : \"%s\"\n", a.ssid);
+  Serial.printf ("  bssid: %s\n", a.bssid);
+  if (a.channel) Serial.printf("  chan : %d\n", a.channel);
+  Serial.println(F("====================================="));
+}
+
+// ----------------------------------------------------------------------------
+// WiFi promiscuous capture
+// ----------------------------------------------------------------------------
+
+static void parseBeaconOrProbe(const uint8_t* payload, int len, int channel) {
+  if (len < 38) return;
+  const uint8_t* bssid = payload + 16;
+  uint16_t capability = payload[34] | (payload[35] << 8);
+  bool isOpen = (capability & 0x0010) == 0;
+
+  int pos = 36; char ssid[33] = {0};
+  while (pos + 2 <= len) {
+    uint8_t tagNum = payload[pos], tagLen = payload[pos + 1];
+    if (pos + 2 + tagLen > len) break;
+    if (tagNum == 0x00) { int n = tagLen > 32 ? 32 : tagLen;
+      memcpy(ssid, payload + pos + 2, n); ssid[n] = '\0'; break; }
+    pos += 2 + tagLen;
+  }
+  if (!ssid[0]) return;
+
+  // Evil portal: OPEN AP with a bait SSID.
+  if (isOpen && isBaitSsid(ssid) &&
+      millis() - gLastPortalAlertMs > kPortalCooldownMs) {
+    gLastPortalAlertMs = millis();
+    gBaitHits++;
+    raiseAlert("ROGUE PORTAL (open)", ssid, bssid, channel);
+    return;
+  }
+  // Evil twin: a protected SSID from a non-allow-listed BSSID.
+  if (isProtectedSsid(ssid) && !isAllowedBssid(bssid) &&
+      millis() - gLastPortalAlertMs > kPortalCooldownMs) {
+    gLastPortalAlertMs = millis();
+    gEvilTwin++;
+    raiseAlert("EVIL TWIN", ssid, bssid, channel);
+  }
+}
+
+static void promiscuousCb(void* buf, wifi_promiscuous_pkt_type_t type) {
+  gAllPkts++;
+  if (type != WIFI_PKT_MGMT) return;
+  const wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+  const uint8_t* payload = pkt->payload;
+  int len = pkt->rx_ctrl.sig_len;
+  int channel = pkt->rx_ctrl.channel;
+  if (len < 24) return;
+  uint8_t subtype = (payload[0] & 0xF0) >> 4;
+
+  if (subtype == 0x08 || subtype == 0x05) {           // beacon / probe-resp
+    // Only parse SSIDs when the Evil Portal mode needs them (saves cycles).
+    if (gMode == MODE_PORTAL) parseBeaconOrProbe(payload, len, channel);
+  } else if (subtype == 0x0C || subtype == 0x0A) {    // deauth / disassoc
+    gDeauth++;
+    gLastDeauthCh = channel;
+  }
+}
+
+static void wifiRadioStart() {
+  static bool inited = false;
+  if (!inited) {
+    nvs_flash_init();
+    esp_netif_init();
+    esp_event_loop_create_default();
+    wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&wcfg);
+    esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    esp_wifi_set_mode(WIFI_MODE_NULL);
+    esp_wifi_start();
+    wifi_promiscuous_filter_t filter = {};
+    filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
+    esp_wifi_set_promiscuous_filter(&filter);
+    esp_wifi_set_promiscuous_rx_cb(&promiscuousCb);
+    inited = true;
+  }
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(gCurrentChannel, WIFI_SECOND_CHAN_NONE);
+}
+static void wifiRadioPause() { esp_wifi_set_promiscuous(false); }
+
+// ----------------------------------------------------------------------------
+// BLE scanning (BT JAM mode)
+// ----------------------------------------------------------------------------
+#if ENABLE_BT
+class BtScanCb : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice d) override { gBtAdvCount++; }
+};
+static void bleScanStart() {
+  wifiRadioPause();                       // free the radio for BLE
+  if (!gBleInited) {
+    BLEDevice::init("");
+    gBleScan = BLEDevice::getScan();
+    gBleScan->setAdvertisedDeviceCallbacks(new BtScanCb(), true);
+    gBleScan->setActiveScan(false);       // passive listen only
+    gBleScan->setInterval(100);
+    gBleScan->setWindow(99);
+    gBleInited = true;
+  }
+}
+static void bleScanStop() {
+  if (gBleInited && gBleScan) gBleScan->stop();
+}
+#endif
+
+// ----------------------------------------------------------------------------
+// OLED
+// ----------------------------------------------------------------------------
+
+static void oledInit() {
+  pinMode(kVextPin, OUTPUT); digitalWrite(kVextPin, LOW); delay(100);
+  pinMode(kOledRst, OUTPUT);
+  digitalWrite(kOledRst, HIGH); delay(1);
+  digitalWrite(kOledRst, LOW);  delay(20);
+  digitalWrite(kOledRst, HIGH); delay(20);
+  Wire.begin(kOledSda, kOledScl);
+  u8g2.setI2CAddress(0x3C << 1);
+  u8g2.begin();
+  u8g2.setFont(u8g2_font_6x10_tf);
+}
+
+static void drawHeader(const char* title) {
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 10, title);
+  u8g2.drawHLine(0, 13, 128);
+  u8g2.drawStr(96, 10, "[>]");          // hint: press button to cycle
+}
+
+static void renderDeauth() {
+  char l[24];
+  u8g2.clearBuffer(); drawHeader("DEAUTH SNIFFER");
+  snprintf(l, sizeof(l), "now:  %lu /s", (unsigned long)gDeauthRate); u8g2.drawStr(0, 28, l);
+  snprintf(l, sizeof(l), "total:%lu", (unsigned long)gDeauth);        u8g2.drawStr(0, 40, l);
+  snprintf(l, sizeof(l), "last ch:%d", gLastDeauthCh);                u8g2.drawStr(0, 52, l);
+  u8g2.drawStr(0, 62, gDeauthRate >= kDeauthRateAlert ? "** FLOOD **" : "watching");
+  u8g2.sendBuffer();
+}
+static void renderJam() {
+  char l[24];
+  u8g2.clearBuffer(); drawHeader("JAM DETECTOR");
+  snprintf(l, sizeof(l), "frames:%lu/s", (unsigned long)gPktRate);    u8g2.drawStr(0, 28, l);
+  snprintf(l, sizeof(l), "thresh:%lu/s", (unsigned long)kJamRateAlert); u8g2.drawStr(0, 40, l);
+  snprintf(l, sizeof(l), "ch:%d", gCurrentChannel);                   u8g2.drawStr(0, 52, l);
+  u8g2.drawStr(0, 62, gPktRate >= kJamRateAlert ? "** RF FLOOD **" : "watching");
+  u8g2.sendBuffer();
+}
+static void renderPortal() {
+  char l[24];
+  u8g2.clearBuffer(); drawHeader("EVIL PORTAL");
+  snprintf(l, sizeof(l), "bait APs:%lu", (unsigned long)gBaitHits);   u8g2.drawStr(0, 28, l);
+  snprintf(l, sizeof(l), "evil twin:%lu", (unsigned long)gEvilTwin);  u8g2.drawStr(0, 40, l);
+  snprintf(l, sizeof(l), "ch:%d", gCurrentChannel);                   u8g2.drawStr(0, 52, l);
+  u8g2.drawStr(0, 62, "watching OPEN APs");
+  u8g2.sendBuffer();
+}
+static void renderBt() {
+  char l[24];
+  u8g2.clearBuffer(); drawHeader("BT JAM SNIFFER");
+#if ENABLE_BT
+  snprintf(l, sizeof(l), "adv/scan:%d", gBtAdvCount);                 u8g2.drawStr(0, 28, l);
+  snprintf(l, sizeof(l), "thresh:%d", kBtAdvRateAlert);               u8g2.drawStr(0, 40, l);
+  u8g2.drawStr(0, 52, "BLE passive scan");
+  u8g2.drawStr(0, 62, gBtAdvCount >= kBtAdvRateAlert ? "** BLE SPAM **" : "watching");
+#else
+  u8g2.drawStr(0, 32, "BT disabled.");
+  u8g2.drawStr(0, 46, "set ENABLE_BT 1");
+#endif
+  u8g2.sendBuffer();
+}
+
+static void renderAlertOverlay(const AlertInfo& a) {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_7x14B_tf);
+  u8g2.drawStr(0, 13, "!! ALERT !!");
+  u8g2.setFont(u8g2_font_6x10_tf);
+  char l[24];
+  strncpy(l, a.kind, sizeof(l) - 1); l[sizeof(l) - 1] = '\0';
+  u8g2.drawStr(0, 28, l);
+  if (a.ssid[0]) { snprintf(l, sizeof(l), "SSID:%s", a.ssid); u8g2.drawStr(0, 40, l); }
+  u8g2.drawStr(0, 52, a.bssid);
+  if (a.channel) { snprintf(l, sizeof(l), "CH:%d", a.channel); u8g2.drawStr(0, 62, l); }
+  u8g2.sendBuffer();
+}
+
+static void renderMode() {
+  switch (gMode) {
+    case MODE_DEAUTH: renderDeauth(); break;
+    case MODE_JAM:    renderJam();    break;
+    case MODE_PORTAL: renderPortal(); break;
+    case MODE_BT:     renderBt();     break;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Mode switching + button
+// ----------------------------------------------------------------------------
+
+static void enterMode(int m) {
+  gMode = m;
+  bool wantBt = (m == MODE_BT);
+#if ENABLE_BT
+  if (wantBt && !gRadioIsBt) { bleScanStart(); gRadioIsBt = true; }
+  if (!wantBt && gRadioIsBt) { bleScanStop(); wifiRadioStart(); gRadioIsBt = false; }
+#else
+  (void)wantBt;
+#endif
+  // Reset the transient per-mode counters so each screen starts clean.
+#if ENABLE_BT
+  gBtAdvCount = 0;
+#endif
+  renderMode();
+}
+
+static void handleButton() {
+  static bool prev = HIGH;
+  static uint32_t lastChange = 0;
+  bool now = digitalRead(kButtonPin);
+  if (prev == HIGH && now == LOW && millis() - lastChange > 250) {
+    lastChange = millis();
+    enterMode((gMode + 1) % MODE_COUNT);
+  }
+  prev = now;
+}
+
+// ----------------------------------------------------------------------------
+// Setup / loop
+// ----------------------------------------------------------------------------
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println(F("\nrogue-ap-detector : multi-mode passive monitor (listen-only)"));
+
+  pinMode(kButtonPin, INPUT_PULLUP);
+  if (kAlertLedPin >= 0) { pinMode(kAlertLedPin, OUTPUT); digitalWrite(kAlertLedPin, LOW); }
+
+  oledInit();
+  u8g2.clearBuffer();
+  u8g2.drawStr(0, 12, "Multi-mode monitor");
+  u8g2.drawStr(0, 28, "listen-only, no TX");
+  u8g2.drawStr(0, 44, "PRG button = modes");
+  u8g2.sendBuffer();
+  delay(1200);
+
+  wifiRadioStart();
+  gRateTick = millis();
+  enterMode(MODE_DEAUTH);
+}
+
+void loop() {
+  handleButton();
+
+#if ENABLE_BT
+  if (gMode == MODE_BT) {
+    // Dedicated BLE loop: 1-second passive scan, then read + reset the count.
+    gBtAdvCount = 0;
+    if (gBleScan) {
+      gBleScan->start(1, false);   // blocks ~1s; the callback tallies gBtAdvCount
+      gBleScan->clearResults();
+    }
+    if (gBtAdvCount >= kBtAdvRateAlert) {
+      uint8_t z[6] = {0};
+      raiseAlert("BLE SPAM / FLOOD", "", z, 0);
+    }
+    // Announce any pending alert, then draw the BT screen.
+    if (gAlertPending) { gAlertPending = false; AlertInfo a = gLastAlert;
+      printAlertSerial(a); flashAlertLed(); renderAlertOverlay(a);
+      gAlertScreenUntil = millis() + kAlertScreenMs; }
+    else if (millis() >= gAlertScreenUntil) renderBt();
+    return;
+  }
+#endif
+
+  // WiFi modes: sweep channels.
+  esp_wifi_set_channel(gCurrentChannel, WIFI_SECOND_CHAN_NONE);
+  gCurrentChannel = (gCurrentChannel >= kMaxChannel) ? 1 : gCurrentChannel + 1;
+  delay(kChannelDwellMs);
+
+  // Per-second rate computation.
+  uint32_t now = millis();
+  if (now - gRateTick >= 1000) {
+    gRateTick = now;
+    gPktRate    = gAllPkts - gRateBasePkts;    gRateBasePkts   = gAllPkts;
+    gDeauthRate = gDeauth  - gRateBaseDeauth;  gRateBaseDeauth = gDeauth;
+
+    // Rate-based alerts for the active mode.
+    if (gMode == MODE_DEAUTH && gDeauthRate >= kDeauthRateAlert) {
+      uint8_t z[6] = {0};
+      raiseAlert("DEAUTH FLOOD", "", z, gLastDeauthCh);
+    }
+    if (gMode == MODE_JAM && gPktRate >= kJamRateAlert) {
+      uint8_t z[6] = {0};
+      raiseAlert("RF FLOOD / JAM?", "", z, gCurrentChannel);
+    }
+  }
+
+  // Announce any pending alert (Evil Portal/evil-twin come from the callback;
+  // deauth/jam from above), then draw the active mode's screen.
+  if (gAlertPending) {
+    gAlertPending = false;
+    AlertInfo a = gLastAlert;
+    printAlertSerial(a);
+    flashAlertLed();
+    renderAlertOverlay(a);
+    gAlertScreenUntil = millis() + kAlertScreenMs;
+  } else if (millis() >= gAlertScreenUntil) {
+    renderMode();
+  }
+}
