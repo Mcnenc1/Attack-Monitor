@@ -1,0 +1,520 @@
+/*
+ * threat-detector  —  multi-page, receive-only wireless threat monitor
+ *                     for the Heltec WiFi LoRa 32 (V3), ESP32-S3.
+ * ---------------------------------------------------------------------------
+ * LISTEN-ONLY detection. The device NEVER transmits attack traffic (no deauth,
+ * beacons, probe responses, or jamming). The only thing it transmits is your
+ * own incident alerts over LoRa to your base station (opt-in, ENABLE_LORA).
+ *
+ * Press the PRG / USER button (GPIO 0) to cycle pages:
+ *   1. DEAUTH        - deauth/disassoc flood detection (per-BSSID baseline)
+ *   2. WIFI JAM      - RF-flood / interference heuristic (frame-rate collapse/spike)
+ *   3. EVIL PORTAL   - OPEN bait APs + evil twins of your SSIDs
+ *   4. BLE SPAM      - BLE advertisement flood (ENABLE_BT)
+ *   5. SUBGHZ JAM    - sub-GHz RSSI jam detection via SX1262 (ENABLE_LORA)
+ *   6. SUBGHZ BRUTE  - sub-GHz burst/brute-force listener via SX1262 (ENABLE_LORA, WIP)
+ *   7. WIFI BRUTE    - auth/assoc flood (possible brute force / MDK-style attack)
+ *
+ * Alerts show on the OLED + Serial, and (ENABLE_LORA) are sent over LoRa.
+ *
+ * ---------------------------------------------------------------------------
+ * BUILD STATUS / HONEST NOTES:
+ *   - Pages 1-4 and 7 (WiFi + BLE) are implemented and testable now.
+ *   - Pages 5-6 and the LoRa uplink use the SX1262 via the RadioLib library.
+ *     They are OFF by default so this compiles with no extra library. To enable:
+ *       1) Library Manager -> install "RadioLib" by Jan Gromes.
+ *       2) Set ENABLE_LORA to 1 below. Set your region frequency (LORA_FREQ).
+ *     Sub-GHz detection is heuristic and needs on-hardware tuning per band.
+ *   - Setup: board "Heltec WiFi LoRa 32(V3)" / "ESP32S3 Dev Module",
+ *     Tools -> USB CDC On Boot -> Enabled. Needs the "U8g2" library.
+ */
+
+#define ENABLE_BT   1     // BLE Spam page (set 0 if the BLE build fails)
+#define ENABLE_LORA 0     // SubGHz pages + LoRa uplink (needs RadioLib; set 1 to enable)
+
+#include <WiFi.h>
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
+#include "esp_timer.h"
+#include <U8g2lib.h>
+#include <Wire.h>
+#include <math.h>
+#if ENABLE_BT
+  #include <BLEDevice.h>
+  #include <BLEScan.h>
+  #include <BLEAdvertisedDevice.h>
+#endif
+#if ENABLE_LORA
+  #include <RadioLib.h>
+#endif
+
+// ----------------------------------------------------------------------------
+// CONFIG
+// ----------------------------------------------------------------------------
+const char* kProtectedSsids[] = { "Guest WiFi", "Acme-Guest" };
+const int kProtectedSsidCount = sizeof(kProtectedSsids) / sizeof(kProtectedSsids[0]);
+const uint8_t kAllowedBssids[][6] = { { 0xAA,0xBB,0xCC,0x11,0x22,0x33 } };
+const int kAllowedBssidCount = sizeof(kAllowedBssids) / sizeof(kAllowedBssids[0]);
+const char* kBaitSsids[] = { "Free WiFi","Free Public WiFi","Public WiFi","Guest WiFi","xfinitywifi","attwifi" };
+const int kBaitSsidCount = sizeof(kBaitSsids) / sizeof(kBaitSsids[0]);
+
+// Detection thresholds (per 1 s window unless noted).
+const uint32_t DEAUTH_ABS      = 20;   // deauth/window/BSSID (per-BSSID path)
+const uint32_t DEAUTH_BCAST    = 5;    // broadcast deauth/window/BSSID
+const uint32_t DEAUTH_RATE_ALERT = 8;  // total deauth/s (robust to channel hopping)
+const float    BASELINE_MARGIN = 8.0f;
+const float    EWMA_ALPHA      = 0.2f;
+const uint32_t BRUTE_ABS       = 25;   // auth+assoc/window/BSSID (per-BSSID path)
+const uint32_t BRUTE_RATE_ALERT = 10;  // total auth+assoc/s (robust to hopping)
+const uint32_t JAM_RATE        = 1200; // all frames/s -> RF flood / jam
+const int      BLE_ADV_ALERT   = 80;   // BLE advs per 1 s scan
+const float    SUBGHZ_JAM_MARGIN = 18.0; // dB above the learned noise floor -> jam
+const int      SUBGHZ_ABS_FLOOR  = -75;  // and must be at least this strong (dBm)
+const int      SUBGHZ_SUSTAIN    = 5;    // consecutive high samples before alerting
+const float    SUBGHZ_BURST_MARGIN = 12.0; // dB above floor that counts as one RF burst
+const int      SUBGHZ_BURST_RATE   = 15;   // bursts/s -> possible brute force
+const int64_t  COOLDOWN_US      = 5000000; // 5 s per-source alert cooldown
+const int      MAX_TRACKED      = 48;
+
+const uint32_t CHANNEL_DWELL_MS = 150;
+const int      MAX_CHANNEL       = 13;
+
+// Hardware pins (Heltec V3).
+const int kButtonPin = 0, kAlertLedPin = 35;
+const int kOledSda = 17, kOledScl = 18, kOledRst = 21, kVextPin = 36;
+#if ENABLE_LORA
+const int kLoraNss = 8, kLoraDio1 = 14, kLoraRst = 12, kLoraBusy = 13;
+const int kLoraSck = 9, kLoraMiso = 11, kLoraMosi = 10;
+const float LORA_FREQ = 915.0;   // MHz: US 915, EU 868, other 433 (set your region!)
+#endif
+const uint32_t kAlertScreenMs = 5000;
+
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, kOledRst, kOledScl, kOledSda);
+#if ENABLE_LORA
+SX1262 lora = new Module(kLoraNss, kLoraDio1, kLoraRst, kLoraBusy);
+static bool gLoraOk = false;
+#endif
+
+// ----------------------------------------------------------------------------
+// Pages
+// ----------------------------------------------------------------------------
+enum Page { P_DEAUTH=0, P_WIFI_JAM, P_EVIL_PORTAL, P_BLE_SPAM,
+            P_SUBGHZ_JAM, P_SUBGHZ_BRUTE, P_WIFI_BRUTE, P_COUNT };
+const char* kPageName[P_COUNT] = {
+  "DEAUTH", "WIFI JAM", "EVIL PORTAL", "BLE SPAM",
+  "SUBGHZ JAM", "SUBGHZ BRUTE", "WIFI BRUTE" };
+static volatile int gPage = P_DEAUTH;
+
+// ----------------------------------------------------------------------------
+// Shared counters (updated in the WiFi RX callback; it only does light math)
+// ----------------------------------------------------------------------------
+static volatile uint32_t gAllPkts = 0;      // all mgmt frames (jam)
+static volatile uint32_t gDeauthTotal = 0;
+static volatile uint32_t gBruteTotal = 0;
+static volatile uint32_t gBaitHits = 0, gEvilTwin = 0;
+static int gCurrentChannel = 1;
+static uint32_t gPktRate = 0, gDeauthRate = 0, gBruteRate = 0;
+static uint32_t gBasePkts = 0, gBaseDeauth = 0, gBaseBrute = 0;
+static int64_t  gRateTick = 0;
+
+// Per-BSSID stats for deauth + brute detection.
+typedef struct {
+  bool used; uint8_t bssid[6];
+  int64_t dWin; uint32_t dCount, dBcast; float dEwma; int64_t dAlert;
+  int64_t bWin; uint32_t bCount; int64_t bAlert;
+  int64_t lastSeen; int8_t rssi; uint8_t ch;
+} stat_t;
+static stat_t gStats[MAX_TRACKED];
+
+// Alert stash (callback-safe: no Serial/LED/radio here; loop announces).
+struct Alert { char kind[28]; char info[88]; int channel; };
+static volatile bool gAlertPending = false;
+static Alert gLastAlert;
+static uint32_t gAlertTotal = 0, gAlertScreenUntil = 0;
+
+#if ENABLE_BT
+static BLEScan* gBleScan = nullptr; static bool gBleInited = false;
+static volatile int gBtAdv = 0;
+#endif
+static bool gRadioIsBt = false;
+#if ENABLE_LORA
+static float gSubRssi = -127.0f, gSubNoise = -999.0f;  // live RSSI + learned floor
+static int gSubHigh = 0; static uint32_t gSubAlertMs = 0;
+static int gSubBursts = 0; static uint32_t gSubBruteAlertMs = 0;
+#endif
+
+// ----------------------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------------------
+static bool macEq(const uint8_t* a, const uint8_t* b){ return memcmp(a,b,6)==0; }
+static bool isProtected(const char* s){ for(int i=0;i<kProtectedSsidCount;i++) if(!strcmp(s,kProtectedSsids[i])) return true; return false; }
+static bool isBait(const char* s){ for(int i=0;i<kBaitSsidCount;i++) if(!strcasecmp(s,kBaitSsids[i])) return true; return false; }
+static bool isAllowed(const uint8_t* m){ for(int i=0;i<kAllowedBssidCount;i++) if(macEq(m,kAllowedBssids[i])) return true; return false; }
+
+static stat_t* slotFor(const uint8_t* b, int64_t now){
+  stat_t* lru=&gStats[0];
+  for(int i=0;i<MAX_TRACKED;i++){ stat_t* s=&gStats[i];
+    if(s->used && macEq(s->bssid,b)) return s;
+    if(!s->used){ memset(s,0,sizeof(*s)); s->used=true; memcpy(s->bssid,b,6); s->dWin=s->bWin=now; return s; }
+    if(s->lastSeen<lru->lastSeen) lru=s; }
+  memset(lru,0,sizeof(*lru)); lru->used=true; memcpy(lru->bssid,b,6); lru->dWin=lru->bWin=now; return lru;
+}
+
+// Stash an alert. SAFE to call from the WiFi callback (no blocking work here).
+static void raiseAlert(const char* kind, const char* info, int channel){
+  strncpy(gLastAlert.kind, kind, sizeof(gLastAlert.kind)-1); gLastAlert.kind[sizeof(gLastAlert.kind)-1]='\0';
+  strncpy(gLastAlert.info, info?info:"", sizeof(gLastAlert.info)-1); gLastAlert.info[sizeof(gLastAlert.info)-1]='\0';
+  gLastAlert.channel = channel; gAlertPending = true;
+}
+
+static void flashLed(){ if(kAlertLedPin<0) return; for(int i=0;i<4;i++){ digitalWrite(kAlertLedPin,HIGH); delay(40); digitalWrite(kAlertLedPin,LOW); delay(40);} }
+
+// ----------------------------------------------------------------------------
+// LoRa uplink + sub-GHz sampling (ENABLE_LORA)
+// ----------------------------------------------------------------------------
+#if ENABLE_LORA
+static void loraInit(){
+  SPI.begin(kLoraSck, kLoraMiso, kLoraMosi, kLoraNss);
+  int st = lora.begin(LORA_FREQ);
+  gLoraOk = (st == RADIOLIB_ERR_NONE);
+  if(gLoraOk) lora.startReceive();   // RX for sub-GHz RSSI sampling
+}
+// Transmit one incident alert to the base station, then return to RX.
+static void loraSendAlert(const char* kind, const char* info){
+  if(!gLoraOk) return;
+  char msg[120]; snprintf(msg,sizeof(msg),"ALERT %s | %s", kind, info);
+  lora.transmit((uint8_t*)msg, strlen(msg));
+  lora.startReceive();
+}
+// Instantaneous channel RSSI (dBm). getRSSI(false) reads the live RSSI register
+// while in RX; getRSSI() (default) would return the LAST PACKET's RSSI, which is
+// stale/garbage when no packet arrives -> that caused the constant false alarm.
+static float subghzRssi(){ return gLoraOk ? lora.getRSSI(false) : -127.0f; }
+#endif
+
+// ----------------------------------------------------------------------------
+// WiFi promiscuous capture (receive-only). Detection runs here (light math);
+// alerts are only stashed, never printed from here.
+// ----------------------------------------------------------------------------
+static void parseMgmtSsid(const uint8_t* p, int len, int ch, const uint8_t* bssid){
+  if(len<38) return;
+  uint16_t cap = p[34] | (p[35]<<8);
+  bool isOpen = (cap & 0x0010)==0;
+  int pos=36; char ssid[33]={0};
+  while(pos+2<=len){ uint8_t t=p[pos], l=p[pos+1]; if(pos+2+l>len) break;
+    if(t==0){ int n=l>32?32:l; memcpy(ssid,p+pos+2,n); ssid[n]='\0'; break; } pos+=2+l; }
+  if(!ssid[0]) return;
+  static int64_t lastPortal=0; int64_t now=esp_timer_get_time();
+  if(isOpen && isBait(ssid) && now-lastPortal>COOLDOWN_US){
+    lastPortal=now; gBaitHits++;
+    char info[88]; snprintf(info,sizeof(info),"OPEN \"%s\" ch%d",ssid,ch);
+    raiseAlert("ROGUE PORTAL", info, ch); return; }
+  if(isProtected(ssid) && !isAllowed(bssid) && now-lastPortal>COOLDOWN_US){
+    lastPortal=now; gEvilTwin++;
+    char info[88]; snprintf(info,sizeof(info),"\"%s\" unknown BSSID ch%d",ssid,ch);
+    raiseAlert("EVIL TWIN", info, ch); }
+}
+
+static void rxCb(void* buf, wifi_promiscuous_pkt_type_t type){
+  if(type!=WIFI_PKT_MGMT) return;
+  const wifi_promiscuous_pkt_t* pkt=(const wifi_promiscuous_pkt_t*)buf;
+  const uint8_t* p=pkt->payload; int len=pkt->rx_ctrl.sig_len;
+  if(len<24) return;
+  gAllPkts++;
+  uint8_t ftype=(p[0]>>2)&0x03, fsub=(p[0]>>4)&0x0F;
+  if(ftype!=0) return;
+  int ch=pkt->rx_ctrl.channel; int8_t rssi=pkt->rx_ctrl.rssi;
+  const uint8_t* dst=p+4; const uint8_t* bssid=p+16;
+  int64_t now=esp_timer_get_time();
+
+  if(fsub==0x0C || fsub==0x0A){                 // deauth / disassoc
+    gDeauthTotal++;
+    bool bcast=true; for(int i=0;i<6;i++) if(dst[i]!=0xFF){bcast=false;break;}
+    stat_t* s=slotFor(bssid,now); s->lastSeen=now; s->rssi=rssi; s->ch=ch;
+    if(now-s->dWin>1000000){ s->dEwma=(1-EWMA_ALPHA)*s->dEwma+EWMA_ALPHA*s->dCount; s->dCount=0; s->dBcast=0; s->dWin=now; }
+    s->dCount++; if(bcast) s->dBcast++;
+    bool flood=(s->dCount>=DEAUTH_ABS)&&((float)s->dCount>=s->dEwma+BASELINE_MARGIN);
+    bool b=(s->dBcast>=DEAUTH_BCAST);
+    if((flood||b)&&now-s->dAlert>COOLDOWN_US){ s->dAlert=now;
+      char info[88]; snprintf(info,sizeof(info),"%02X%02X%02X %u/s b%u ch%d %ddBm",
+        s->bssid[3],s->bssid[4],s->bssid[5],(unsigned)s->dCount,(unsigned)s->dBcast,ch,rssi);
+      raiseAlert(b?"DEAUTH BCAST":"DEAUTH FLOOD", info, ch); }
+  } else if(fsub==0x0B || fsub==0x00 || fsub==0x02){  // auth / assoc / reassoc req
+    gBruteTotal++;
+    stat_t* s=slotFor(bssid,now); s->lastSeen=now; s->rssi=rssi; s->ch=ch;
+    if(now-s->bWin>1000000){ s->bCount=0; s->bWin=now; }
+    s->bCount++;
+    if(s->bCount>=BRUTE_ABS && now-s->bAlert>COOLDOWN_US){ s->bAlert=now;
+      char info[88]; snprintf(info,sizeof(info),"%02X%02X%02X %u auth/s ch%d",
+        s->bssid[3],s->bssid[4],s->bssid[5],(unsigned)s->bCount,ch);
+      raiseAlert("WIFI BRUTE", info, ch); }
+  } else if(fsub==0x08 || fsub==0x05){           // beacon / probe-resp
+    if(gPage==P_EVIL_PORTAL) parseMgmtSsid(p,len,ch,bssid);
+  }
+}
+
+static void radioStart(){
+  nvs_flash_init(); esp_netif_init(); esp_event_loop_create_default();
+  wifi_init_config_t cfg=WIFI_INIT_CONFIG_DEFAULT(); esp_wifi_init(&cfg);
+  esp_wifi_set_storage(WIFI_STORAGE_RAM); esp_wifi_set_mode(WIFI_MODE_NULL); esp_wifi_start();
+  wifi_promiscuous_filter_t f={}; f.filter_mask=WIFI_PROMIS_FILTER_MASK_MGMT;
+  esp_wifi_set_promiscuous_filter(&f); esp_wifi_set_promiscuous_rx_cb(&rxCb);
+  esp_wifi_set_promiscuous(true); esp_wifi_set_channel(1,WIFI_SECOND_CHAN_NONE);
+}
+static void wifiPromis(bool on){ esp_wifi_set_promiscuous(on); }
+
+// ----------------------------------------------------------------------------
+// BLE (ENABLE_BT)
+// ----------------------------------------------------------------------------
+#if ENABLE_BT
+class BtCb : public BLEAdvertisedDeviceCallbacks { void onResult(BLEAdvertisedDevice d) override { gBtAdv++; } };
+static void bleStart(){ wifiPromis(false);
+  if(!gBleInited){ BLEDevice::init(""); gBleScan=BLEDevice::getScan();
+    gBleScan->setAdvertisedDeviceCallbacks(new BtCb(), true); gBleScan->setActiveScan(false);
+    gBleScan->setInterval(100); gBleScan->setWindow(99); gBleInited=true; } }
+static void bleStop(){ if(gBleInited&&gBleScan) gBleScan->stop(); }
+#endif
+
+// ----------------------------------------------------------------------------
+// OLED
+// ----------------------------------------------------------------------------
+static void oledInit(){
+  pinMode(kVextPin,OUTPUT); digitalWrite(kVextPin,LOW); delay(100);
+  pinMode(kOledRst,OUTPUT); digitalWrite(kOledRst,HIGH); delay(1);
+  digitalWrite(kOledRst,LOW); delay(20); digitalWrite(kOledRst,HIGH); delay(20);
+  Wire.begin(kOledSda,kOledScl); u8g2.setI2CAddress(0x3C<<1); u8g2.begin(); u8g2.setFont(u8g2_font_6x10_tf);
+}
+static void header(const char* t){ u8g2.setFont(u8g2_font_6x10_tf); u8g2.drawStr(0,10,t); u8g2.drawHLine(0,13,128); u8g2.drawStr(104,10,"[>]"); }
+
+static void renderPage(){
+  char l[24]; u8g2.clearBuffer(); header(kPageName[gPage]);
+  switch(gPage){
+    case P_DEAUTH:
+      snprintf(l,sizeof(l),"now:  %lu /s",(unsigned long)gDeauthRate); u8g2.drawStr(0,28,l);
+      snprintf(l,sizeof(l),"total:%lu",(unsigned long)gDeauthTotal);   u8g2.drawStr(0,40,l);
+      snprintf(l,sizeof(l),"alerts:%lu",(unsigned long)gAlertTotal);   u8g2.drawStr(0,52,l);
+      u8g2.drawStr(0,62, gDeauthRate>=DEAUTH_ABS?"** FLOOD **":"watching"); break;
+    case P_WIFI_JAM:
+      snprintf(l,sizeof(l),"frames:%lu/s",(unsigned long)gPktRate);    u8g2.drawStr(0,28,l);
+      snprintf(l,sizeof(l),"thresh:%lu/s",(unsigned long)JAM_RATE);    u8g2.drawStr(0,40,l);
+      snprintf(l,sizeof(l),"ch:%d",gCurrentChannel);                   u8g2.drawStr(0,52,l);
+      u8g2.drawStr(0,62, gPktRate>=JAM_RATE?"** RF FLOOD **":"watching"); break;
+    case P_EVIL_PORTAL:
+      snprintf(l,sizeof(l),"bait APs:%lu",(unsigned long)gBaitHits);   u8g2.drawStr(0,28,l);
+      snprintf(l,sizeof(l),"evil twin:%lu",(unsigned long)gEvilTwin);  u8g2.drawStr(0,40,l);
+      u8g2.drawStr(0,52,"watching OPEN APs");
+      snprintf(l,sizeof(l),"ch:%d",gCurrentChannel);                   u8g2.drawStr(0,62,l); break;
+    case P_BLE_SPAM:
+#if ENABLE_BT
+      snprintf(l,sizeof(l),"adv/scan:%d",gBtAdv);                      u8g2.drawStr(0,28,l);
+      snprintf(l,sizeof(l),"thresh:%d",BLE_ADV_ALERT);                 u8g2.drawStr(0,40,l);
+      u8g2.drawStr(0,52,"BLE passive scan");
+      u8g2.drawStr(0,62, gBtAdv>=BLE_ADV_ALERT?"** BLE SPAM **":"watching");
+#else
+      u8g2.drawStr(0,34,"BT disabled"); u8g2.drawStr(0,48,"set ENABLE_BT 1");
+#endif
+      break;
+    case P_SUBGHZ_JAM:
+#if ENABLE_LORA
+      if(gLoraOk){ snprintf(l,sizeof(l),"RSSI: %d dBm",(int)gSubRssi); u8g2.drawStr(0,28,l);
+        snprintf(l,sizeof(l),"floor:%d dBm",(int)gSubNoise); u8g2.drawStr(0,40,l);
+        snprintf(l,sizeof(l),"jam> floor+%d",(int)SUBGHZ_JAM_MARGIN); u8g2.drawStr(0,52,l);
+        u8g2.drawStr(0,62, gSubHigh>=SUBGHZ_SUSTAIN?"** JAM **":"watching"); }
+      else u8g2.drawStr(0,34,"LoRa init failed");
+#else
+      u8g2.drawStr(0,28,"LoRa disabled"); u8g2.drawStr(0,42,"install RadioLib,"); u8g2.drawStr(0,54,"set ENABLE_LORA 1");
+#endif
+      break;
+    case P_SUBGHZ_BRUTE:
+#if ENABLE_LORA
+      if(gLoraOk){ snprintf(l,sizeof(l),"bursts:%d /s",gSubBursts); u8g2.drawStr(0,28,l);
+        snprintf(l,sizeof(l),"thresh:%d /s",SUBGHZ_BURST_RATE); u8g2.drawStr(0,40,l);
+        snprintf(l,sizeof(l),"floor:%d dBm",(int)gSubNoise); u8g2.drawStr(0,52,l);
+        u8g2.drawStr(0,62, gSubBursts>=SUBGHZ_BURST_RATE?"** BRUTE **":"watching"); }
+      else u8g2.drawStr(0,34,"LoRa init failed");
+#else
+      u8g2.drawStr(0,28,"LoRa disabled"); u8g2.drawStr(0,42,"install RadioLib,"); u8g2.drawStr(0,54,"set ENABLE_LORA 1");
+#endif
+      break;
+    case P_WIFI_BRUTE:
+      snprintf(l,sizeof(l),"auth:  %lu /s",(unsigned long)gBruteRate); u8g2.drawStr(0,28,l);
+      snprintf(l,sizeof(l),"total:%lu",(unsigned long)gBruteTotal);    u8g2.drawStr(0,40,l);
+      snprintf(l,sizeof(l),"thresh:%lu/s",(unsigned long)BRUTE_ABS);   u8g2.drawStr(0,52,l);
+      u8g2.drawStr(0,62, gBruteRate>=BRUTE_ABS?"** AUTH FLOOD **":"watching"); break;
+  }
+  u8g2.sendBuffer();
+}
+
+static void renderAlert(){
+  u8g2.clearBuffer(); u8g2.setFont(u8g2_font_7x14B_tf); u8g2.drawStr(0,13,"!! ALERT !!");
+  u8g2.setFont(u8g2_font_6x10_tf); u8g2.drawStr(0,28,gLastAlert.kind);
+  u8g2.setFont(u8g2_font_5x7_tf);
+  int y=40; const char* s=gLastAlert.info; char line[27];
+  while(*s && y<=62){ int n=0; while(s[n]&&n<25)n++; memcpy(line,s,n); line[n]='\0'; u8g2.drawStr(0,y,line); s+=n; y+=9; }
+  u8g2.sendBuffer();
+}
+
+// Opening splash: a rotating radar sweep with flashing "contacts".
+static void splashRadar(){
+  const int cx=64, cy=36, R=25;
+  const float TWO_PI_F = 6.28318f;
+  struct { float ang; int rad; } blip[] = {
+    {0.6f,18},{2.1f,23},{3.6f,12},{5.0f,21},{4.2f,8} };
+  const int nb = 5;
+  for(int frame=0; frame<120; frame++){
+    float sweep = frame * 0.16f;
+    u8g2.clearBuffer();
+    // rings + crosshair
+    u8g2.drawCircle(cx,cy,R, U8G2_DRAW_ALL);
+    u8g2.drawCircle(cx,cy,(R*2)/3, U8G2_DRAW_ALL);
+    u8g2.drawCircle(cx,cy,R/3, U8G2_DRAW_ALL);
+    u8g2.drawHLine(cx-R,cy,2*R);
+    u8g2.drawVLine(cx,cy-R,2*R);
+    // sweep beam + short trailing line
+    u8g2.drawLine(cx,cy, cx+(int)(R*cosf(sweep)),        cy+(int)(R*sinf(sweep)));
+    u8g2.drawLine(cx,cy, cx+(int)(R*cosf(sweep-0.30f)),  cy+(int)(R*sinf(sweep-0.30f)));
+    // contacts light up as the beam passes
+    for(int i=0;i<nb;i++){
+      float d = fmodf(sweep - blip[i].ang, TWO_PI_F); if(d<0) d+=TWO_PI_F;
+      if(d < 0.7f){
+        int bx=cx+(int)(blip[i].rad*cosf(blip[i].ang));
+        int by=cy+(int)(blip[i].rad*sinf(blip[i].ang));
+        u8g2.drawDisc(bx,by, d<0.25f?3:2, U8G2_DRAW_ALL);
+      }
+    }
+    // title
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(40,8,"CERBERUS");
+    u8g2.sendBuffer();
+    delay(16);
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Pages / button
+// ----------------------------------------------------------------------------
+static void enterPage(int p){
+  gPage=p; bool wantBt=(p==P_BLE_SPAM);
+#if ENABLE_BT
+  if(wantBt && !gRadioIsBt){ bleStart(); gRadioIsBt=true; gBtAdv=0; }
+  if(!wantBt && gRadioIsBt){ bleStop(); wifiPromis(true); gRadioIsBt=false; }
+#else
+  (void)wantBt;
+#endif
+  renderPage();
+}
+static void handleButton(){
+  static bool prev=HIGH; static uint32_t last=0; bool now=digitalRead(kButtonPin);
+  if(prev==HIGH && now==LOW && millis()-last>250){ last=millis(); enterPage((gPage+1)%P_COUNT); }
+  prev=now;
+}
+static void announceIfPending(){
+  if(!gAlertPending) return; gAlertPending=false; gAlertTotal++;
+  Alert a=gLastAlert;
+  Serial.printf("[ALERT] %s | %s\n", a.kind, a.info);
+#if ENABLE_LORA
+  loraSendAlert(a.kind, a.info);
+#endif
+  flashLed(); renderAlert(); gAlertScreenUntil=millis()+kAlertScreenMs;
+}
+
+// ----------------------------------------------------------------------------
+// Setup / loop
+// ----------------------------------------------------------------------------
+void setup(){
+  Serial.begin(115200); delay(300);
+  Serial.println(F("\nCERBERUS : three-band receive-only wireless threat monitor"));
+  pinMode(kButtonPin, INPUT_PULLUP);
+  if(kAlertLedPin>=0){ pinMode(kAlertLedPin,OUTPUT); digitalWrite(kAlertLedPin,LOW); }
+  memset(gStats,0,sizeof(gStats));
+  oledInit();
+  splashRadar();                              // animated opening sweep
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_7x14B_tf); u8g2.drawStr(36,22,"CERBERUS");
+  u8g2.setFont(u8g2_font_6x10_tf);  u8g2.drawStr(4,40,"WiFi  BLE  SubGHz");
+  u8g2.drawStr(4,54,"PRG=cycle  RX-only"); u8g2.sendBuffer(); delay(1100);
+  radioStart();
+#if ENABLE_LORA
+  loraInit();
+#endif
+  gRateTick=esp_timer_get_time();
+  enterPage(P_DEAUTH);
+}
+
+void loop(){
+  handleButton();
+
+#if ENABLE_BT
+  if(gPage==P_BLE_SPAM){
+    gBtAdv=0; if(gBleScan){ gBleScan->start(1,false); gBleScan->clearResults(); }
+    if(gBtAdv>=BLE_ADV_ALERT){ char info[88]; snprintf(info,sizeof(info),"%d adv/s",gBtAdv); raiseAlert("BLE SPAM",info,0); }
+    announceIfPending();
+    if(millis()>=gAlertScreenUntil) renderPage();
+    return;
+  }
+#endif
+
+#if ENABLE_LORA
+  if(gPage==P_SUBGHZ_BRUTE && gLoraOk){
+    // Fast-sample RSSI for ~1s and count rising edges above the floor. A
+    // brute-force cycles many short bursts; a single fob press is only a few.
+    if(gSubNoise < -200.0f) gSubNoise = subghzRssi();
+    int bursts=0; bool above=false; float peak=-200.0f;
+    uint32_t until=millis()+1000;
+    while((int32_t)(until-millis())>0){
+      float r=lora.getRSSI(false);
+      if(r>peak) peak=r;
+      bool hi = r > gSubNoise + SUBGHZ_BURST_MARGIN;
+      if(hi && !above){ bursts++; above=true; }
+      else if(!hi){ above=false; gSubNoise = 0.995f*gSubNoise + 0.005f*r; }
+      delayMicroseconds(800);
+    }
+    gSubBursts=bursts; gSubRssi=peak;
+    if(bursts>=SUBGHZ_BURST_RATE && millis()-gSubBruteAlertMs>5000){
+      gSubBruteAlertMs=millis();
+      char info[88]; snprintf(info,sizeof(info),"%d bursts/s peak%d dBm @%.0fMHz",bursts,(int)peak,LORA_FREQ);
+      raiseAlert("SUBGHZ BRUTE", info, 0);
+    }
+    announceIfPending();
+    if(millis()>=gAlertScreenUntil) renderPage();
+    return;
+  }
+  if(gPage==P_SUBGHZ_JAM && gLoraOk){
+    float r=subghzRssi();
+    gSubRssi=r;
+    if(gSubNoise < -200.0f) gSubNoise=r;        // first sample seeds the floor
+    bool high = (r > gSubNoise + SUBGHZ_JAM_MARGIN) && (r > SUBGHZ_ABS_FLOOR);
+    if(high){
+      gSubHigh++;
+    } else {
+      gSubHigh=0;
+      gSubNoise = 0.95f*gSubNoise + 0.05f*r;     // learn the floor only when quiet
+    }
+    if(gSubHigh>=SUBGHZ_SUSTAIN && millis()-gSubAlertMs>5000){
+      gSubAlertMs=millis();
+      char info[88]; snprintf(info,sizeof(info),"RSSI %d dBm (floor %d) @%.0fMHz",(int)r,(int)gSubNoise,LORA_FREQ);
+      raiseAlert("SUBGHZ JAM", info, 0);
+    }
+  }
+#endif
+
+  // WiFi pages: sweep channels.
+  gCurrentChannel=(gCurrentChannel>=MAX_CHANNEL)?1:gCurrentChannel+1;
+  esp_wifi_set_channel(gCurrentChannel,WIFI_SECOND_CHAN_NONE);
+  delay(CHANNEL_DWELL_MS);
+
+  int64_t now=esp_timer_get_time();
+  if(now-gRateTick>=1000000){ gRateTick=now;
+    gPktRate=gAllPkts-gBasePkts; gBasePkts=gAllPkts;
+    gDeauthRate=gDeauthTotal-gBaseDeauth; gBaseDeauth=gDeauthTotal;
+    gBruteRate=gBruteTotal-gBaseBrute; gBaseBrute=gBruteTotal;
+    if(gPage==P_WIFI_JAM && gPktRate>=JAM_RATE){ char info[88]; snprintf(info,sizeof(info),"%lu frames/s ch%d",(unsigned long)gPktRate,gCurrentChannel); raiseAlert("RF FLOOD/JAM",info,gCurrentChannel); }
+    if(gPage==P_DEAUTH && gDeauthRate>=DEAUTH_RATE_ALERT){ char info[88]; snprintf(info,sizeof(info),"%lu deauth/s (hopping)",(unsigned long)gDeauthRate); raiseAlert("DEAUTH FLOOD",info,gCurrentChannel); }
+    if(gPage==P_WIFI_BRUTE && gBruteRate>=BRUTE_RATE_ALERT){ char info[88]; snprintf(info,sizeof(info),"%lu auth/s (hopping)",(unsigned long)gBruteRate); raiseAlert("WIFI BRUTE",info,gCurrentChannel); }
+  }
+
+  announceIfPending();
+  if(millis()>=gAlertScreenUntil) renderPage();
+}
